@@ -418,3 +418,227 @@ extension Array where Element == [UInt8] {
         }
     }
 }
+
+// MARK: - Data Preparation and Encoding
+extension QREncoder {
+    // MARK: - Data Preparation
+    static func prepareData(content: String, mode: Int?, encoding: String?) throws -> [Segment] {
+        let segments = SegmentCollection()
+        
+        if let mode = mode {
+            try segments.addSegment(makeSegment(content: content, mode: mode, encoding: encoding))
+        } else {
+            // Auto-detect mode if not specified
+            let data = content.data(using: .utf8) ?? Data()
+            let detectedMode = findMode(data: data)
+            try segments.addSegment(makeSegment(content: content, mode: detectedMode, encoding: encoding))
+        }
+        
+        return segments.segments
+    }
+    
+    // MARK: - Mode Detection
+    static func findMode(data: Data) -> Int {
+        if isNumeric(data) {
+            return QRConstants.MODE_NUMERIC
+        }
+        if isAlphanumeric(data) {
+            return QRConstants.MODE_ALPHANUMERIC
+        }
+        if isKanji(data) {
+            return QRConstants.MODE_KANJI
+        }
+        return QRConstants.MODE_BYTE
+    }
+    
+    // MARK: - Mode Checking
+    private static func isNumeric(_ data: Data) -> Bool {
+        let numbers = Set("0123456789".utf8)
+        return data.allSatisfy { numbers.contains($0) }
+    }
+    
+    private static func isAlphanumeric(_ data: Data) -> Bool {
+        let validChars = Set(QRConstants.ALPHANUMERIC_CHARS.utf8)
+        return data.allSatisfy { validChars.contains($0) }
+    }
+    
+    private static func isKanji(_ data: Data) -> Bool {
+        guard data.count % 2 == 0 else { return false }
+        
+        var isValid = true
+        data.withUnsafeBytes { ptr in
+            let shorts = ptr.bindMemory(to: UInt16.self)
+            for i in 0..<shorts.count {
+                let code = shorts[i].bigEndian
+                if !((0x8140...0x9FFC).contains(code) || (0xE040...0xEBBF).contains(code)) {
+                    isValid = false
+                    break
+                }
+            }
+        }
+        return isValid
+    }
+    
+    // MARK: - Segment Creation
+    static func makeSegment(content: String, mode: Int, encoding: String?) throws -> Segment {
+        let buffer = Buffer()
+        var charCount = 0
+        
+        switch mode {
+        case QRConstants.MODE_NUMERIC:
+            try encodeNumeric(content, into: buffer)
+            charCount = content.count
+            
+        case QRConstants.MODE_ALPHANUMERIC:
+            try encodeAlphanumeric(content, into: buffer)
+            charCount = content.count
+            
+        case QRConstants.MODE_BYTE:
+            let (data, count, finalEncoding) = try dataToBytes(content, encoding: encoding)
+            try encodeByte(data, into: buffer)
+            charCount = count
+            return Segment(bits: buffer.getBits(), charCount: charCount, mode: mode, encoding: finalEncoding)
+            
+        case QRConstants.MODE_KANJI:
+            try encodeKanji(content, into: buffer)
+            charCount = content.count / 2
+            
+        default:
+            throw QREncoderError.invalidMode("Unsupported mode")
+        }
+        
+        return Segment(bits: buffer.getBits(), charCount: charCount, mode: mode, encoding: nil)
+    }
+    
+    // MARK: - Mode-specific Encoding
+    private static func encodeNumeric(_ content: String, into buffer: Buffer) throws {
+        // Process groups of 3 digits
+        var remaining = content
+        while !remaining.isEmpty {
+            let chunk = String(remaining.prefix(3))
+            remaining = String(remaining.dropFirst(min(3, remaining.count)))
+            
+            guard let value = Int(chunk) else {
+                throw QREncoderError.invalidMode("Invalid numeric data")
+            }
+            
+            // Convert to binary with appropriate bit length
+            let bitLength = chunk.count * 3 + 1
+            buffer.appendBits(value, length: bitLength)
+        }
+    }
+    
+    private static func encodeAlphanumeric(_ content: String, into buffer: Buffer) throws {
+        var remaining = content
+        while !remaining.isEmpty {
+            let chunk = remaining.prefix(2)
+            remaining = String(remaining.dropFirst(min(2, remaining.count)))
+            
+            if chunk.count == 2 {
+                // Process pairs of characters
+                let first = try getAlphanumericValue(chunk.first!)
+                let second = try getAlphanumericValue(chunk.last!)
+                buffer.appendBits(first * 45 + second, length: 11)
+            } else {
+                // Process single character
+                let value = try getAlphanumericValue(chunk.first!)
+                buffer.appendBits(value, length: 6)
+            }
+        }
+    }
+    
+    private static func encodeByte(_ data: Data, into buffer: Buffer) throws {
+        for byte in data {
+            buffer.appendBits(Int(byte), length: 8)
+        }
+    }
+    
+    private static func encodeKanji(_ content: String, into buffer: Buffer) throws {
+        guard let data = content.data(using: .shiftJIS) else {
+            throw QREncoderError.invalidMode("Invalid Kanji data")
+        }
+        
+        var i = 0
+        while i < data.count {
+            let byte1 = Int(data[i])
+            let byte2 = Int(data[i + 1])
+            let code = (byte1 << 8) | byte2
+            
+            var diff: Int
+            if (0x8140...0x9FFC).contains(code) {
+                diff = code - 0x8140
+            } else if (0xE040...0xEBBF).contains(code) {
+                diff = code - 0xC140
+            } else {
+                throw QREncoderError.invalidMode("Invalid Kanji byte sequence")
+            }
+            
+            let value = ((diff >> 8) * 0xC0) + (diff & 0xFF)
+            buffer.appendBits(value, length: 13)
+            i += 2
+        }
+    }
+    
+    // MARK: - Helper Methods
+    private static func getAlphanumericValue(_ char: Character) throws -> Int {
+        guard let index = QRConstants.ALPHANUMERIC_CHARS.firstIndex(of: char) else {
+            throw QREncoderError.invalidMode("Invalid alphanumeric character: \(char)")
+        }
+        return QRConstants.ALPHANUMERIC_CHARS.distance(from: QRConstants.ALPHANUMERIC_CHARS.startIndex, to: index)
+    }
+    
+    private static func dataToBytes(_ data: String, encoding: String?) throws -> (Data, Int, String) {
+        // Try the specified encoding first
+        if let encoding = encoding,
+           let encodedData = data.data(using: .init(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringConvertIANACharSetNameToEncoding(encoding as CFString)))) {
+            return (encodedData, encodedData.count, encoding)
+        }
+        
+        // Try default encodings in order
+        let encodings: [(String, String.Encoding)] = [
+            (QRConstants.DEFAULT_BYTE_ENCODING, .isoLatin1),
+            (QRConstants.KANJI_ENCODING, .shiftJIS),
+            ("utf-8", .utf8)
+        ]
+        
+        for (encodingName, encoding) in encodings {
+            if let encodedData = data.data(using: encoding) {
+                return (encodedData, encodedData.count, encodingName)
+            }
+        }
+        
+        throw QREncoderError.invalidMode("Unable to encode data with any supported encoding")
+    }
+}
+
+// MARK: - Segment Collection
+class SegmentCollection {
+    private(set) var segments: [Segment] = []
+    private(set) var bitLength: Int = 0
+    private(set) var modes: [Int] = []
+    
+    func addSegment(_ segment: Segment) {
+        if let lastSegment = segments.last,
+           lastSegment.mode == segment.mode,
+           lastSegment.encoding == segment.encoding {
+            // Merge with previous segment
+            var mergedBits = lastSegment.bits
+            mergedBits.append(contentsOf: segment.bits)
+            let mergedSegment = Segment(
+                bits: mergedBits,
+                charCount: lastSegment.charCount + segment.charCount,
+                mode: segment.mode,
+                encoding: segment.encoding
+            )
+            segments.removeLast()
+            modes.removeLast()
+            bitLength -= lastSegment.bits.count
+            segments.append(mergedSegment)
+        } else {
+            segments.append(segment)
+        }
+        
+        bitLength += segment.bits.count
+        modes.append(segment.mode)
+    }
+}
