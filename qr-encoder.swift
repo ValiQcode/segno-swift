@@ -1982,3 +1982,313 @@ extension QREncoder {
         }
     }
 }
+
+// MARK: - QR Code Output Formats
+extension QREncoder {
+    /// Style configuration for QR code output
+    public struct Style {
+        /// Module (square) size in pixels/points
+        public let moduleSize: CGFloat
+        
+        /// Quiet zone (white border) size in modules
+        public let quietZone: Int
+        
+        /// Dark module color
+        public let foregroundColor: Color
+        
+        /// Light module color
+        public let backgroundColor: Color
+        
+        /// Optional data module shape customization
+        public let dataShape: ModuleShape
+        
+        public init(
+            moduleSize: CGFloat = 10,
+            quietZone: Int = 4,
+            foregroundColor: Color = .black,
+            backgroundColor: Color = .white,
+            dataShape: ModuleShape = .square
+        ) {
+            self.moduleSize = moduleSize
+            self.quietZone = max(quietZone, 0)
+            self.foregroundColor = foregroundColor
+            self.backgroundColor = backgroundColor
+            self.dataShape = dataShape
+        }
+    }
+    
+    /// Module shape options for QR code output
+    public enum ModuleShape {
+        case square
+        case circle
+        case roundedRect(cornerRadius: CGFloat)
+    }
+    
+    /// Color representation (platform independent)
+    public struct Color {
+        let red: CGFloat
+        let green: CGFloat
+        let blue: CGFloat
+        let alpha: CGFloat
+        
+        public static let black = Color(red: 0, green: 0, blue: 0, alpha: 1)
+        public static let white = Color(red: 1, green: 1, blue: 1, alpha: 1)
+        
+        public init(red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat = 1) {
+            self.red = red
+            self.green = green
+            self.blue = blue
+            self.alpha = alpha
+        }
+        
+        /// Initialize from hex string
+        public init?(hex: String) {
+            var hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+            hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")
+            
+            var rgb: UInt64 = 0
+            guard Scanner(string: hexSanitized).scanHexInt64(&rgb) else {
+                return nil
+            }
+            
+            self.red = CGFloat((rgb & 0xFF0000) >> 16) / 255.0
+            self.green = CGFloat((rgb & 0x00FF00) >> 8) / 255.0
+            self.blue = CGFloat(rgb & 0x0000FF) / 255.0
+            self.alpha = 1.0
+        }
+        
+        /// Convert to hex string
+        var hexString: String {
+            String(
+                format: "#%02X%02X%02X",
+                Int(red * 255),
+                Int(green * 255),
+                Int(blue * 255)
+            )
+        }
+    }
+    
+    // MARK: - SVG Generation
+    
+    /// Generate SVG representation of the QR code
+    static func toSVG(code: Code, style: Style = Style()) -> String {
+        let matrix = code.matrix
+        let quietZone = style.quietZone
+        let moduleSize = style.moduleSize
+        
+        // Calculate dimensions
+        let matrixSize = matrix.count
+        let totalSize = (matrixSize + 2 * quietZone) * Int(moduleSize)
+        
+        // Start SVG document
+        var svg = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <svg width="\(totalSize)" height="\(totalSize)" version="1.1" xmlns="http://www.w3.org/2000/svg">
+        """
+        
+        // Add background
+        svg += """
+        <rect width="100%" height="100%" fill="\(style.backgroundColor.hexString)"/>
+        """
+        
+        // Generate modules
+        for row in 0..<matrixSize {
+            for col in 0..<matrixSize {
+                if matrix[row][col] == 1 {
+                    let x = (quietZone + col) * Int(moduleSize)
+                    let y = (quietZone + row) * Int(moduleSize)
+                    
+                    switch style.dataShape {
+                    case .square:
+                        svg += """
+                        <rect x="\(x)" y="\(y)" width="\(moduleSize)" height="\(moduleSize)" \
+                        fill="\(style.foregroundColor.hexString)"/>
+                        """
+                        
+                    case .circle:
+                        let radius = moduleSize / 2
+                        let cx = CGFloat(x) + radius
+                        let cy = CGFloat(y) + radius
+                        svg += """
+                        <circle cx="\(cx)" cy="\(cy)" r="\(radius)" \
+                        fill="\(style.foregroundColor.hexString)"/>
+                        """
+                        
+                    case .roundedRect(let cornerRadius):
+                        svg += """
+                        <rect x="\(x)" y="\(y)" width="\(moduleSize)" height="\(moduleSize)" \
+                        rx="\(cornerRadius)" ry="\(cornerRadius)" fill="\(style.foregroundColor.hexString)"/>
+                        """
+                    }
+                }
+            }
+        }
+        
+        svg += "</svg>"
+        return svg
+    }
+    
+    // MARK: - PNG Data Generation
+    
+    /// Generate PNG data representation of the QR code
+    static func toPNGData(code: Code, style: Style = Style()) -> Data? {
+        let matrix = code.matrix
+        let quietZone = style.quietZone
+        let moduleSize = Int(style.moduleSize)
+        
+        // Calculate dimensions
+        let matrixSize = matrix.count
+        let totalSize = (matrixSize + 2 * quietZone) * moduleSize
+        
+        // Create bitmap context
+        let bytesPerPixel = 4
+        let bytesPerRow = totalSize * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: totalSize * bytesPerRow)
+        
+        // Fill background
+        let bgRed = UInt8(style.backgroundColor.red * 255)
+        let bgGreen = UInt8(style.backgroundColor.green * 255)
+        let bgBlue = UInt8(style.backgroundColor.blue * 255)
+        let bgAlpha = UInt8(style.backgroundColor.alpha * 255)
+        
+        for y in 0..<totalSize {
+            for x in 0..<totalSize {
+                let offset = (y * totalSize + x) * bytesPerPixel
+                pixels[offset] = bgRed
+                pixels[offset + 1] = bgGreen
+                pixels[offset + 2] = bgBlue
+                pixels[offset + 3] = bgAlpha
+            }
+        }
+        
+        // Draw modules
+        let fgRed = UInt8(style.foregroundColor.red * 255)
+        let fgGreen = UInt8(style.foregroundColor.green * 255)
+        let fgBlue = UInt8(style.foregroundColor.blue * 255)
+        let fgAlpha = UInt8(style.foregroundColor.alpha * 255)
+        
+        for row in 0..<matrixSize {
+            for col in 0..<matrixSize {
+                if matrix[row][col] == 1 {
+                    let startX = (quietZone + col) * moduleSize
+                    let startY = (quietZone + row) * moduleSize
+                    
+                    for y in startY..<(startY + moduleSize) {
+                        for x in startX..<(startX + moduleSize) {
+                            let offset = (y * totalSize + x) * bytesPerPixel
+                            
+                            // Apply shape masks if needed
+                            var shouldDraw = true
+                            switch style.dataShape {
+                            case .circle:
+                                let centerX = CGFloat(startX) + CGFloat(moduleSize) / 2
+                                let centerY = CGFloat(startY) + CGFloat(moduleSize) / 2
+                                let distance = sqrt(pow(CGFloat(x) - centerX, 2) + pow(CGFloat(y) - centerY, 2))
+                                shouldDraw = distance <= CGFloat(moduleSize) / 2
+                                
+                            case .roundedRect(let cornerRadius):
+                                let relX = CGFloat(x - startX)
+                                let relY = CGFloat(y - startY)
+                                let size = CGFloat(moduleSize)
+                                
+                                // Check if point is in corner regions
+                                if relX < cornerRadius && relY < cornerRadius {
+                                    // Top-left corner
+                                    shouldDraw = sqrt(pow(cornerRadius - relX, 2) + pow(cornerRadius - relY, 2)) <= cornerRadius
+                                } else if relX > (size - cornerRadius) && relY < cornerRadius {
+                                    // Top-right corner
+                                    shouldDraw = sqrt(pow(relX - (size - cornerRadius), 2) + pow(cornerRadius - relY, 2)) <= cornerRadius
+                                } else if relX < cornerRadius && relY > (size - cornerRadius) {
+                                    // Bottom-left corner
+                                    shouldDraw = sqrt(pow(cornerRadius - relX, 2) + pow(relY - (size - cornerRadius), 2)) <= cornerRadius
+                                } else if relX > (size - cornerRadius) && relY > (size - cornerRadius) {
+                                    // Bottom-right corner
+                                    shouldDraw = sqrt(pow(relX - (size - cornerRadius), 2) + pow(relY - (size - cornerRadius), 2)) <= cornerRadius
+                                }
+                                
+                            default:
+                                break
+                            }
+                            
+                            if shouldDraw {
+                                pixels[offset] = fgRed
+                                pixels[offset + 1] = fgGreen
+                                pixels[offset + 2] = fgBlue
+                                pixels[offset + 3] = fgAlpha
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Create CGImage
+        guard let context = CGContext(
+            data: &pixels,
+            width: totalSize,
+            height: totalSize,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ),
+        let cgImage = context.makeImage() else {
+            return nil
+        }
+        
+        // Convert to PNG data
+        #if os(iOS) || os(watchOS) || os(tvOS)
+        let image = UIImage(cgImage: cgImage)
+        return image.pngData()
+        #elseif os(macOS)
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: totalSize, height: totalSize))
+        guard let tiffData = image.tiffRepresentation,
+              let bitmapImage = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+        return bitmapImage.representation(using: .png, properties: [:])
+        #endif
+    }
+    
+    // MARK: - String Output
+    
+    /// Generate ASCII art representation of the QR code
+    static func toASCII(code: Code, darkModule: Character = "██", lightModule: Character = "  ") -> String {
+        let matrix = code.matrix
+        var result = ""
+        
+        for row in matrix {
+            for value in row {
+                result += String(repeating: value == 1 ? darkModule : lightModule, count: 1)
+            }
+            result += "\n"
+        }
+        
+        return result
+    }
+    
+    // MARK: - Utility Methods
+    
+    /// Get QR code size in modules (including quiet zone)
+    static func size(code: Code, quietZone: Int = 4) -> Int {
+        code.matrix.count + 2 * quietZone
+    }
+    
+    /// Get module coordinates for a given point
+    static func moduleCoordinates(at point: CGPoint,
+                                code: Code,
+                                style: Style = Style()) -> (row: Int, col: Int)? {
+        let totalSize = size(code: code, quietZone: style.quietZone)
+        let moduleSize = style.moduleSize
+        
+        let row = Int(point.y / moduleSize) - style.quietZone
+        let col = Int(point.x / moduleSize) - style.quietZone
+        
+        guard row >= 0 && row < code.matrix.count &&
+              col >= 0 && col < code.matrix.count else {
+            return nil
+        }
+        
+        return (row, col)
+    }
+}
