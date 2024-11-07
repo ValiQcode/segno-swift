@@ -824,3 +824,289 @@ extension Buffer {
         return newBuffer
     }
 }
+
+// MARK: - Data Masking
+extension QREncoder {
+    // MARK: - Mask Pattern Application
+    static func findAndApplyBestMask(matrix: [[UInt8]], width: Int, height: Int, proposedMask: Int?) throws -> (mask: Int, matrix: [[UInt8]]) {
+        let isMicro = width == height && width < 21
+        
+        // Create matrix to check encoding regions
+        var functionMatrix = makeMatrix(width: width, height: height)
+        addFinderPatterns(to: &functionMatrix, width: width, height: height)
+        addAlignmentPatterns(to: &functionMatrix, width: width, height: height)
+        
+        if !isMicro {
+            functionMatrix[functionMatrix.count - 8][8] = 1
+        }
+        
+        // Helper function to check if a position belongs to the encoding region
+        let isEncodingRegion = { (row: Int, col: Int) -> Bool in
+            functionMatrix[row][col] > 0x1
+        }
+        
+        // If a mask is proposed, apply it and return
+        if let proposedMask = proposedMask {
+            var maskedMatrix = matrix
+            applyMask(to: &maskedMatrix, mask: proposedMask, isMicro: isMicro, isEncodingRegion: isEncodingRegion)
+            return (proposedMask, maskedMatrix)
+        }
+        
+        // Try all masks and find the best one
+        let masks = isMicro ? 4 : 8
+        var bestScore = isMicro ? -1 : Int.max
+        var bestMask = 0
+        var bestMatrix: [[UInt8]]?
+        
+        let evaluator = isMicro ? evaluateMicroMask : evaluateMask
+        let isBetter: (Int, Int) -> Bool = isMicro ? (>) : (<)
+        
+        for maskPattern in 0..<masks {
+            var testMatrix = matrix
+            applyMask(to: &testMatrix, mask: maskPattern, isMicro: isMicro, isEncodingRegion: isEncodingRegion)
+            let score = evaluator(testMatrix, width, height)
+            
+            if bestMatrix == nil || isBetter(score, bestScore) {
+                bestScore = score
+                bestMask = maskPattern
+                bestMatrix = testMatrix
+            }
+        }
+        
+        guard let finalMatrix = bestMatrix else {
+            throw QREncoderError.invalidMask("Failed to find valid mask pattern")
+        }
+        
+        return (bestMask, finalMatrix)
+    }
+    
+    // MARK: - Mask Pattern Application
+    private static func applyMask(to matrix: inout [[UInt8]],
+                                mask: Int,
+                                isMicro: Bool,
+                                isEncodingRegion: (Int, Int) -> Bool) {
+        let maskFunction = getMaskFunction(pattern: mask, isMicro: isMicro)
+        
+        for i in 0..<matrix.count {
+            for j in 0..<matrix[i].count {
+                if isEncodingRegion(i, j) {
+                    matrix[i][j] ^= (maskFunction(i, j) ? 1 : 0)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Mask Pattern Functions
+    private static func getMaskFunction(pattern: Int, isMicro: Bool) -> (Int, Int) -> Bool {
+        if isMicro {
+            return getMicroMaskFunction(pattern: pattern)
+        }
+        return getQRMaskFunction(pattern: pattern)
+    }
+    
+    private static func getQRMaskFunction(pattern: Int) -> (Int, Int) -> Bool {
+        switch pattern {
+        case 0:
+            return { (i, j) in (i + j) % 2 == 0 }
+        case 1:
+            return { (i, _) in i % 2 == 0 }
+        case 2:
+            return { (_, j) in j % 3 == 0 }
+        case 3:
+            return { (i, j) in (i + j) % 3 == 0 }
+        case 4:
+            return { (i, j) in (i / 2 + j / 3) % 2 == 0 }
+        case 5:
+            return { (i, j) in
+                let temp = i * j
+                return (temp % 2 + temp % 3) == 0
+            }
+        case 6:
+            return { (i, j) in
+                let temp = i * j
+                return ((temp % 2 + temp % 3) % 2) == 0
+            }
+        case 7:
+            return { (i, j) in
+                return ((i + j) % 2 + (i * j) % 3) % 2 == 0
+            }
+        default:
+            return { _, _ in false }
+        }
+    }
+    
+    private static func getMicroMaskFunction(pattern: Int) -> (Int, Int) -> Bool {
+        switch pattern {
+        case 0:
+            return { (i, _) in i % 2 == 0 }
+        case 1:
+            return { (i, j) in (i / 2 + j / 3) % 2 == 0 }
+        case 2:
+            return { (i, j) in
+                let temp = i * j
+                return ((temp % 2 + temp % 3) % 2) == 0
+            }
+        case 3:
+            return { (i, j) in
+                return ((i + j) % 2 + (i * j) % 3) % 2 == 0
+            }
+        default:
+            return { _, _ in false }
+        }
+    }
+    
+    // MARK: - Mask Evaluation
+    private static func evaluateMask(_ matrix: [[UInt8]], _ width: Int, _ height: Int) -> Int {
+        // Calculate all penalty scores
+        let n1 = calculateN1PenaltyScore(matrix)
+        let n2 = calculateN2PenaltyScore(matrix)
+        let n3 = calculateN3PenaltyScore(matrix)
+        let n4 = calculateN4PenaltyScore(matrix)
+        
+        return n1 + n2 + n3 + n4
+    }
+    
+    private static func evaluateMicroMask(_ matrix: [[UInt8]], _ width: Int, _ height: Int) -> Int {
+        var sum1 = 0
+        var sum2 = 0
+        
+        // Calculate sums for the last column and row (excluding first element)
+        for i in 1..<height {
+            sum1 += Int(matrix[i][width - 1])
+        }
+        
+        for j in 1..<width {
+            sum2 += Int(matrix[height - 1][j])
+        }
+        
+        return sum1 <= sum2 ? (sum1 * 16 + sum2) : (sum2 * 16 + sum1)
+    }
+    
+    // MARK: - Penalty Score Calculations
+    private static func calculateN1PenaltyScore(_ matrix: [[UInt8]]) -> Int {
+        var score = 0
+        let size = matrix.count
+        
+        // Check horizontal runs
+        for row in 0..<size {
+            var runLength = 1
+            var prevBit = matrix[row][0]
+            
+            for col in 1..<size {
+                let bit = matrix[row][col]
+                if bit == prevBit {
+                    runLength += 1
+                } else {
+                    if runLength >= 5 {
+                        score += runLength - 2
+                    }
+                    runLength = 1
+                    prevBit = bit
+                }
+            }
+            if runLength >= 5 {
+                score += runLength - 2
+            }
+        }
+        
+        // Check vertical runs
+        for col in 0..<size {
+            var runLength = 1
+            var prevBit = matrix[0][col]
+            
+            for row in 1..<size {
+                let bit = matrix[row][col]
+                if bit == prevBit {
+                    runLength += 1
+                } else {
+                    if runLength >= 5 {
+                        score += runLength - 2
+                    }
+                    runLength = 1
+                    prevBit = bit
+                }
+            }
+            if runLength >= 5 {
+                score += runLength - 2
+            }
+        }
+        
+        return score
+    }
+    
+    private static func calculateN2PenaltyScore(_ matrix: [[UInt8]]) -> Int {
+        var score = 0
+        let size = matrix.count
+        
+        for row in 0..<(size - 1) {
+            for col in 0..<(size - 1) {
+                let bit = matrix[row][col]
+                if bit == matrix[row][col + 1] &&
+                    bit == matrix[row + 1][col] &&
+                    bit == matrix[row + 1][col + 1] {
+                    score += 3
+                }
+            }
+        }
+        
+        return score
+    }
+    
+    private static func calculateN3PenaltyScore(_ matrix: [[UInt8]]) -> Int {
+        var score = 0
+        let size = matrix.count
+        let pattern1: [UInt8] = [1, 0, 1, 1, 1, 0, 1]
+        
+        // Check horizontal patterns
+        for row in 0..<size {
+            let rowArray = Array(matrix[row])
+            if let _ = findPattern(pattern1, in: rowArray) {
+                score += 40
+            }
+        }
+        
+        // Check vertical patterns
+        for col in 0..<size {
+            let colArray = (0..<size).map { matrix[$0][col] }
+            if let _ = findPattern(pattern1, in: colArray) {
+                score += 40
+            }
+        }
+        
+        return score
+    }
+    
+    private static func calculateN4PenaltyScore(_ matrix: [[UInt8]]) -> Int {
+        let size = matrix.count
+        var darkCount = 0
+        let totalCount = size * size
+        
+        for row in matrix {
+            darkCount += row.reduce(0) { $0 + Int($1) }
+        }
+        
+        let percentage = Double(darkCount) * 100 / Double(totalCount)
+        let previous20 = Int((percentage + 5) / 10) * 10 - 50
+        let next20 = Int(previous20 + 10)
+        
+        return min(abs(previous20), abs(next20)) * 10
+    }
+    
+    // MARK: - Helper Methods
+    private static func findPattern(_ pattern: [UInt8], in array: [UInt8]) -> Int? {
+        let patternLength = pattern.count
+        for i in 0...(array.count - patternLength) {
+            var matches = true
+            for j in 0..<patternLength {
+                if array[i + j] != pattern[j] {
+                    matches = false
+                    break
+                }
+            }
+            if matches {
+                return i
+            }
+        }
+        return nil
+    }
+}
