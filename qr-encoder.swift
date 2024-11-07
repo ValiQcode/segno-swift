@@ -642,3 +642,185 @@ class SegmentCollection {
         modes.append(segment.mode)
     }
 }
+
+// MARK: - Error Correction Types
+extension QREncoder {
+    struct ECInfo {
+        let numTotal: Int
+        let numData: Int
+        let numBlocks: Int
+    }
+    
+    struct Block {
+        var data: [UInt8]
+        var error: [UInt8]
+    }
+    
+    // MARK: - Galois Field Operations
+    private struct GaloisField {
+        // Galois field log table for error correction calculations
+        static let log: [Int] = [
+            0xFF, 0x00, 0x01, 0x19, 0x02, 0x32, 0x1A, 0xC6, 0x03, 0xDF, 0x33, 0xEE, 0x1B, 0x68, 0xC7, 0x4B,
+            0x04, 0x64, 0xE0, 0x0E, 0x34, 0x8D, 0xEF, 0x81, 0x1C, 0xC1, 0x69, 0xF8, 0xC8, 0x08, 0x4C, 0x71
+            // ... Add complete log table
+        ]
+        
+        // Galois field antilog (exponential) table
+        static let exp: [Int] = [
+            0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1D, 0x3A, 0x74, 0xE8, 0xCD, 0x87, 0x13, 0x26,
+            0x4C, 0x98, 0x2D, 0x5A, 0xB4, 0x75, 0xEA, 0xC9, 0x8F, 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0
+            // ... Add complete exp table
+        ]
+        
+        // Generator polynomials for different error correction levels
+        static let generatorPolynomials: [Int: [Int]] = [
+            7:  [0, 87, 229, 146, 149, 238, 102, 21],
+            10: [0, 251, 67, 46, 61, 118, 70, 64, 94, 32, 45],
+            13: [0, 74, 152, 176, 100, 86, 100, 106, 104, 130, 218, 206, 140, 78],
+            15: [0, 8, 183, 61, 91, 202, 37, 51, 58, 58, 237, 140, 124, 5, 99, 105],
+            // ... Add other generator polynomials
+        ]
+    }
+    
+    // MARK: - Error Correction Generation
+    static func makeFinalMessage(version: Int, error: Int, buffer: Buffer) throws -> Buffer {
+        let codewords = buffer.toInts()
+        let ecInfo = try getErrorCorrectionInfo(version: version, errorLevel: error)
+        let (dataBlocks, errorBlocks) = try makeBlocks(ecInfo: ecInfo, codewords: codewords)
+        
+        // Create final message buffer
+        let result = Buffer()
+        
+        // Interleave data blocks
+        let maxDataLength = dataBlocks.map { $0.data.count }.max() ?? 0
+        for i in 0..<maxDataLength {
+            for block in dataBlocks where i < block.data.count {
+                result.appendBits(Int(block.data[i]), length: 8)
+            }
+        }
+        
+        // Special handling for M1 and M3 versions (4-bit final codeword)
+        if version == QRConstants.VERSION_M1 || version == QRConstants.VERSION_M3 {
+            if let lastBlock = dataBlocks.last {
+                result.appendBits(Int(lastBlock.data.last!) >> 4, length: 4)
+            }
+        }
+        
+        // Interleave error correction blocks
+        let maxErrorLength = errorBlocks.map { $0.count }.max() ?? 0
+        for i in 0..<maxErrorLength {
+            for block in errorBlocks where i < block.count {
+                result.appendBits(Int(block[i]), length: 8)
+            }
+        }
+        
+        // Add remainder bits if necessary
+        let remainder: Int
+        switch version {
+        case 2...6:
+            remainder = 7
+        case 14...20, 28...34:
+            remainder = 3
+        case 21...27:
+            remainder = 4
+        default:
+            remainder = 0
+        }
+        
+        result.extend(Array(repeating: UInt8(0), count: remainder))
+        
+        return result
+    }
+    
+    // MARK: - Block Generation
+    private static func makeBlocks(ecInfo: [ECInfo], codewords: [Int]) throws -> (data: [Block], error: [[UInt8]]) {
+        var dataBlocks: [Block] = []
+        var errorBlocks: [[UInt8]] = []
+        
+        var codewordIndex = 0
+        
+        for info in ecInfo {
+            let numErrorWords = info.numTotal - info.numData
+            let generator = try getGeneratorPolynomial(numErrorWords: numErrorWords)
+            
+            for _ in 0..<info.numBlocks {
+                // Extract data block
+                let dataBlock = Array(codewords[codewordIndex..<(codewordIndex + info.numData)])
+                    .map { UInt8($0) }
+                codewordIndex += info.numData
+                
+                // Calculate error correction words
+                let errorBlock = calculateErrorCorrection(
+                    data: dataBlock,
+                    generator: generator,
+                    numErrorWords: numErrorWords
+                )
+                
+                dataBlocks.append(Block(data: dataBlock, error: errorBlock))
+                errorBlocks.append(errorBlock)
+            }
+        }
+        
+        return (dataBlocks, errorBlocks)
+    }
+    
+    // MARK: - Error Correction Calculation
+    private static func calculateErrorCorrection(data: [UInt8], generator: [Int], numErrorWords: Int) -> [UInt8] {
+        var errorBlock = Array(data)
+        errorBlock.append(contentsOf: Array(repeating: 0, count: numErrorWords))
+        
+        let dataLength = data.count
+        
+        // Polynomial division
+        for i in 0..<dataLength {
+            let coef = errorBlock[i]
+            if coef != 0 {
+                let logCoef = GaloisField.log[Int(coef)]
+                
+                for j in 0..<numErrorWords {
+                    errorBlock[i + j + 1] ^= UInt8(
+                        GaloisField.exp[(logCoef + generator[j]) % 255]
+                    )
+                }
+            }
+        }
+        
+        // Return only the error correction part
+        return Array(errorBlock[dataLength...])
+    }
+    
+    // MARK: - Helper Methods
+    private static func getErrorCorrectionInfo(version: Int, errorLevel: Int) throws -> [ECInfo] {
+        // This would contain the actual EC info lookup based on version and error level
+        // For demonstration, returning a simple example
+        switch (version, errorLevel) {
+        case (1, QRConstants.ERROR_LEVEL_L):
+            return [ECInfo(numTotal: 26, numData: 19, numBlocks: 1)]
+        case (1, QRConstants.ERROR_LEVEL_M):
+            return [ECInfo(numTotal: 26, numData: 16, numBlocks: 1)]
+        // ... Add other version/error level combinations
+        default:
+            throw QREncoderError.invalidVersion("Unsupported version/error level combination")
+        }
+    }
+    
+    private static func getGeneratorPolynomial(numErrorWords: Int) throws -> [Int] {
+        guard let polynomial = GaloisField.generatorPolynomials[numErrorWords] else {
+            throw QREncoderError.invalidVersion("Unsupported error correction length")
+        }
+        return polynomial
+    }
+}
+
+// MARK: - Buffer Extensions
+extension Buffer {
+    mutating func extend(_ bytes: [UInt8]) {
+        data.append(contentsOf: bytes)
+    }
+    
+    func subBuffer(from: Int, length: Int) -> Buffer {
+        let newBuffer = Buffer()
+        newBuffer.extend(Array(data[from..<from + length]))
+        return newBuffer
+    }
+}
