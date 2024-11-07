@@ -1372,3 +1372,291 @@ extension QREncoder {
         }
     }
 }
+
+// MARK: - QR Code Final Assembly
+extension QREncoder {
+    /// Main encode function to create the final QR code
+    static func encodeInternal(segments: [Segment],
+                             error: Int?,
+                             version: Int,
+                             mask: Int?,
+                             eci: Bool,
+                             boostError: Bool,
+                             structuredAppendInfo: StructuredAppendInfo? = nil) throws -> Code {
+        
+        let isMicro = version < 1
+        let isStructuredAppend = structuredAppendInfo != nil
+        
+        // Step 1: Prepare data buffer
+        let buffer = try prepareDataBuffer(
+            segments: segments,
+            version: version,
+            error: error,
+            eci: eci,
+            structuredAppendInfo: structuredAppendInfo
+        )
+        
+        // Step 2: Determine final error correction level
+        let finalError = try determineFinalErrorLevel(
+            version: version,
+            error: error,
+            segments: segments,
+            eci: eci,
+            boostError: boostError,
+            isStructuredAppend: isStructuredAppend
+        )
+        
+        // Step 3: Create final message with error correction
+        let finalMessage = try makeFinalMessage(
+            version: version,
+            error: finalError,
+            buffer: buffer
+        )
+        
+        // Step 4: Create and initialize matrix
+        let matrixSize = calculateMatrixSize(version: version)
+        var matrix = makeMatrix(width: matrixSize, height: matrixSize)
+        
+        // Step 5: Add function patterns
+        addFunctionPatterns(to: &matrix, version: version)
+        
+        // Step 6: Add codewords
+        try addCodewords(to: &matrix, codewords: finalMessage, version: version)
+        
+        // Step 7: Find and apply best mask
+        let (bestMask, maskedMatrix) = try findAndApplyBestMask(
+            matrix: matrix,
+            width: matrixSize,
+            height: matrixSize,
+            proposedMask: mask
+        )
+        
+        // Step 8: Add format and version information
+        var finalMatrix = maskedMatrix
+        try addFormatInfo(
+            to: &finalMatrix,
+            version: version,
+            errorLevel: finalError,
+            maskPattern: bestMask
+        )
+        
+        if version >= 7 {
+            try addVersionInfo(to: &finalMatrix, version: version)
+        }
+        
+        return Code(
+            matrix: finalMatrix,
+            version: version,
+            error: finalError,
+            mask: bestMask,
+            segments: segments
+        )
+    }
+    
+    // MARK: - Helper Methods
+    
+    private static func prepareDataBuffer(segments: [Segment],
+                                        version: Int,
+                                        error: Int?,
+                                        eci: Bool,
+                                        structuredAppendInfo: StructuredAppendInfo?) throws -> Buffer {
+        let buffer = Buffer()
+        
+        // Add structured append information if present
+        if let saInfo = structuredAppendInfo {
+            buffer.appendBits(QRConstants.MODE_STRUCTURED_APPEND, length: 4)
+            buffer.appendBits(saInfo.symbolNumber, length: 4)
+            buffer.appendBits(saInfo.totalSymbols, length: 4)
+            buffer.appendBits(saInfo.parityData, length: 8)
+        }
+        
+        // Add segments
+        for segment in segments {
+            try addSegmentToBuffer(
+                segment,
+                to: buffer,
+                version: version,
+                eci: eci
+            )
+        }
+        
+        // Add terminator and padding
+        try addTerminatorAndPadding(
+            to: buffer,
+            version: version,
+            error: error
+        )
+        
+        return buffer
+    }
+    
+    private static func addSegmentToBuffer(_ segment: Segment,
+                                         to buffer: Buffer,
+                                         version: Int,
+                                         eci: Bool) throws {
+        let isMicro = version < 1
+        
+        // Add ECI mode indicator and assignment number if needed
+        if eci && segment.mode == QRConstants.MODE_BYTE &&
+            segment.encoding != QRConstants.DEFAULT_BYTE_ENCODING {
+            buffer.appendBits(QRConstants.MODE_ECI, length: 4)
+            if let assignmentNumber = try? getECIAssignmentNumber(for: segment.encoding) {
+                buffer.appendBits(assignmentNumber, length: 8)
+            }
+        }
+        
+        // Add mode indicator
+        if version > QRConstants.VERSION_M1 {  // M1 has no mode indicator
+            let modeIndicatorLength = isMicro ? version + 3 : 4
+            let modeValue = isMicro ? getMicroModeValue(segment.mode) : segment.mode
+            buffer.appendBits(modeValue, length: modeIndicatorLength)
+        }
+        
+        // Add character count indicator
+        let charCountLength = try getCharacterCountLength(
+            mode: segment.mode,
+            version: version
+        )
+        buffer.appendBits(segment.charCount, length: charCountLength)
+        
+        // Add data
+        buffer.append(segment.bits)
+    }
+    
+    private static func addTerminatorAndPadding(to buffer: Buffer,
+                                              version: Int,
+                                              error: Int?) throws {
+        let capacity = try getSymbolCapacity(version: version, errorLevel: error)
+        
+        // Add terminator
+        let terminator = try getTerminatorLength(version: version)
+        let remainingBits = capacity - buffer.count
+        let terminatorLength = min(remainingBits, terminator)
+        buffer.extend(Array(repeating: 0, count: terminatorLength))
+        
+        // Add padding bits to meet codeword boundary
+        if version != QRConstants.VERSION_M1 && version != QRConstants.VERSION_M3 {
+            let paddingLength = 8 - (buffer.count % 8)
+            if paddingLength < 8 {
+                buffer.extend(Array(repeating: 0, count: paddingLength))
+            }
+        }
+        
+        // Add padding codewords if necessary
+        var paddingBytes = capacity - buffer.count
+        while paddingBytes >= 8 {
+            buffer.appendBits(0xEC, length: 8)  // 236
+            if paddingBytes >= 16 {
+                buffer.appendBits(0x11, length: 8)  // 17
+            }
+            paddingBytes -= 16
+        }
+    }
+    
+    private static func addFunctionPatterns(to matrix: inout [[UInt8]], version: Int) {
+        let size = matrix.count
+        
+        // Add finder patterns
+        addFinderPatterns(to: &matrix, width: size, height: size)
+        
+        // Add alignment patterns for versions >= 2
+        if version >= 2 {
+            addAlignmentPatterns(to: &matrix, width: size, height: size)
+        }
+        
+        // Add timing patterns
+        let isMicro = version < 1
+        addTimingPattern(to: &matrix, isMicro: isMicro)
+    }
+    
+    private static func determineFinalErrorLevel(version: Int,
+                                               error: Int?,
+                                               segments: [Segment],
+                                               eci: Bool,
+                                               boostError: Bool,
+                                               isStructuredAppend: Bool) throws -> Int {
+        var finalError = error
+        
+        if version != QRConstants.VERSION_M1 && finalError == nil {
+            finalError = QRConstants.ERROR_LEVEL_L
+        }
+        
+        if boostError {
+            finalError = try boostErrorLevel(
+                version: version,
+                error: finalError,
+                segments: segments,
+                eci: eci,
+                isStructuredAppend: isStructuredAppend
+            )
+        }
+        
+        return finalError ?? 0
+    }
+    
+    // MARK: - Utility Functions
+    
+    private static func getCharacterCountLength(mode: Int, version: Int) throws -> Int {
+        let isMicro = version < 1
+        let versionRange = isMicro ? version : getVersionRange(version)
+        
+        let cciBits: [Int: [Int: Int]] = [
+            QRConstants.MODE_NUMERIC: [
+                QRConstants.VERSION_M1: 3,
+                QRConstants.VERSION_M2: 4,
+                QRConstants.VERSION_M3: 5,
+                QRConstants.VERSION_M4: 6,
+                1: 10,  // Versions 1-9
+                2: 12,  // Versions 10-26
+                3: 14   // Versions 27-40
+            ],
+            // Add other modes...
+        ]
+        
+        guard let modeBits = cciBits[mode],
+              let length = modeBits[versionRange] else {
+            throw QREncoderError.invalidVersion("Invalid version for character count indicator")
+        }
+        
+        return length
+    }
+    
+    private static func getVersionRange(_ version: Int) -> Int {
+        if version <= 9 {
+            return 1
+        } else if version <= 26 {
+            return 2
+        } else {
+            return 3
+        }
+    }
+    
+    private static func getMicroModeValue(_ mode: Int) -> Int {
+        // Convert QR mode to Micro QR mode
+        let microModeMapping: [Int: Int] = [
+            QRConstants.MODE_NUMERIC: 0,
+            QRConstants.MODE_ALPHANUMERIC: 1,
+            QRConstants.MODE_BYTE: 2,
+            QRConstants.MODE_KANJI: 3
+        ]
+        return microModeMapping[mode] ?? 0
+    }
+}
+
+// MARK: - Supporting Types
+
+struct StructuredAppendInfo {
+    let symbolNumber: Int      // 0-15
+    let totalSymbols: Int      // 1-16
+    let parityData: Int
+}
+
+extension QREncoder {
+    static func calculateStructuredAppendParity(for content: String) -> Int {
+        var parity = 0
+        for byte in content.utf8 {
+            parity ^= Int(byte)
+        }
+        return parity
+    }
+}
