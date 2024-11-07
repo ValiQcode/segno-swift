@@ -2292,3 +2292,322 @@ extension QREncoder {
         return (row, col)
     }
 }
+
+// MARK: - Public API
+public final class QRCode {
+    /// The internal code representation
+    private let code: QREncoder.Code
+    
+    /// Style configuration
+    private var style: QREncoder.Style
+    
+    // MARK: - Public Properties
+    
+    /// The QR code version
+    public var version: Int {
+        code.version
+    }
+    
+    /// The error correction level
+    public var errorLevel: ErrorLevel {
+        ErrorLevel(rawValue: code.error) ?? .medium
+    }
+    
+    /// The mask pattern used
+    public var mask: Int {
+        code.mask
+    }
+    
+    /// The matrix size (number of modules)
+    public var size: Int {
+        code.matrix.count
+    }
+    
+    // MARK: - Public Enums
+    
+    public enum ErrorLevel: Int {
+        case low = 0
+        case medium = 1
+        case quartile = 2
+        case high = 3
+        
+        var description: String {
+            switch self {
+            case .low: return "L"
+            case .medium: return "M"
+            case .quartile: return "Q"
+            case .high: return "H"
+            }
+        }
+    }
+    
+    public enum QRError: Error {
+        case encodingError(String)
+        case invalidInput(String)
+        case invalidConfiguration(String)
+    }
+    
+    // MARK: - Initialization
+    
+    /// Create a QR code with the given content and options
+    public static func create(
+        _ content: String,
+        errorLevel: ErrorLevel = .medium,
+        version: Int? = nil,
+        mask: Int? = nil,
+        encoding: String? = nil,
+        micro: Bool? = nil
+    ) throws -> QRCode {
+        let options = QREncoder.EncodingOptions(
+            version: version,
+            errorLevel: errorLevel.rawValue,
+            mode: nil,
+            mask: mask,
+            encoding: encoding,
+            eci: false,
+            micro: micro,
+            boostError: true
+        )
+        
+        do {
+            let code = try QREncoder.validateAndEncode(content, options: options)
+            return QRCode(code: code)
+        } catch {
+            throw QRError.encodingError(error.localizedDescription)
+        }
+    }
+    
+    private init(code: QREncoder.Code, style: QREncoder.Style = QREncoder.Style()) {
+        self.code = code
+        self.style = style
+    }
+    
+    // MARK: - Styling
+    
+    /// Apply new style configuration
+    @discardableResult
+    public func applyStyle(_ style: QREncoder.Style) -> QRCode {
+        self.style = style
+        return self
+    }
+    
+    /// Set the module size
+    @discardableResult
+    public func moduleSize(_ size: CGFloat) -> QRCode {
+        var newStyle = style
+        newStyle.moduleSize = size
+        self.style = newStyle
+        return self
+    }
+    
+    /// Set the quiet zone size
+    @discardableResult
+    public func quietZone(_ size: Int) -> QRCode {
+        var newStyle = style
+        newStyle.quietZone = size
+        self.style = newStyle
+        return self
+    }
+    
+    /// Set the colors
+    @discardableResult
+    public func colors(front: QREncoder.Color, back: QREncoder.Color? = nil) -> QRCode {
+        var newStyle = style
+        newStyle.foregroundColor = front
+        if let back = back {
+            newStyle.backgroundColor = back
+        }
+        self.style = newStyle
+        return self
+    }
+    
+    // MARK: - Output Generation
+    
+    /// Generate SVG representation
+    public func svg() -> String {
+        QREncoder.toSVG(code: code, style: style)
+    }
+    
+    /// Generate PNG data
+    public func pngData() -> Data? {
+        QREncoder.toPNGData(code: code, style: style)
+    }
+    
+    /// Generate ASCII representation
+    public func ascii(dark: Character = "██", light: Character = "  ") -> String {
+        QREncoder.toASCII(code: code, darkModule: dark, lightModule: light)
+    }
+    
+    // MARK: - Utility Methods
+    
+    /// Check if a module is dark at the given coordinates
+    public func isDark(row: Int, col: Int) -> Bool {
+        guard row >= 0 && row < size && col >= 0 && col < size else {
+            return false
+        }
+        return code.matrix[row][col] == 1
+    }
+    
+    /// Get the total size including quiet zone
+    public func totalSize(unitSize: CGFloat? = nil) -> CGFloat {
+        let moduleSize = unitSize ?? style.moduleSize
+        return CGFloat(size + 2 * style.quietZone) * moduleSize
+    }
+    
+    /// Get module bounds for a specific position
+    public func moduleBounds(row: Int, col: Int) -> CGRect {
+        let x = CGFloat(style.quietZone + col) * style.moduleSize
+        let y = CGFloat(style.quietZone + row) * style.moduleSize
+        return CGRect(x: x, y: y, width: style.moduleSize, height: style.moduleSize)
+    }
+}
+
+// MARK: - Utility Extensions
+extension QRCode {
+    /// QR Code metadata
+    public struct Metadata {
+        public let version: Int
+        public let errorLevel: ErrorLevel
+        public let mask: Int
+        public let micro: Bool
+        public let moduleCount: Int
+        public let capacity: Int
+        
+        fileprivate init(code: QREncoder.Code) {
+            self.version = code.version
+            self.errorLevel = ErrorLevel(rawValue: code.error) ?? .medium
+            self.mask = code.mask
+            self.micro = code.version < 1
+            self.moduleCount = code.matrix.count
+            self.capacity = QREncoder.calculateSymbolCapacity(
+                version: code.version,
+                errorLevel: code.error
+            )
+        }
+    }
+    
+    /// Get QR code metadata
+    public var metadata: Metadata {
+        Metadata(code: code)
+    }
+    
+    /// Check if this is a Micro QR code
+    public var isMicro: Bool {
+        version < 1
+    }
+    
+    /// Create a sequence of QR codes for large content
+    public static func sequence(
+        _ content: String,
+        errorLevel: ErrorLevel = .medium,
+        version: Int? = nil
+    ) throws -> [QRCode] {
+        do {
+            let codes = try QREncoder.encodeSequence(
+                content: content,
+                error: errorLevel.rawValue,
+                version: version
+            )
+            return codes.map { QRCode(code: $0) }
+        } catch {
+            throw QRError.encodingError(error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - Additional Utilities
+extension QRCode {
+    /// Segment analysis information
+    public struct SegmentInfo {
+        public let mode: Int
+        public let characterCount: Int
+        public let bitCount: Int
+        public let encoding: String?
+    }
+    
+    /// Get information about the encoded segments
+    public var segments: [SegmentInfo] {
+        code.segments.map { segment in
+            SegmentInfo(
+                mode: segment.mode,
+                characterCount: segment.charCount,
+                bitCount: segment.bits.count,
+                encoding: segment.encoding
+            )
+        }
+    }
+    
+    /// Calculate ideal version for content
+    public static func idealVersion(
+        for content: String,
+        errorLevel: ErrorLevel = .medium,
+        micro: Bool? = nil
+    ) throws -> Int {
+        do {
+            let segments = try QREncoder.prepareData(
+                content: content,
+                mode: nil,
+                encoding: nil
+            )
+            return try QREncoder.findVersion(
+                segments: segments,
+                error: errorLevel.rawValue,
+                eci: false,
+                micro: micro
+            )
+        } catch {
+            throw QRError.encodingError(error.localizedDescription)
+        }
+    }
+    
+    /// Validate if content can fit in specified version
+    public static func validateContent(
+        _ content: String,
+        version: Int,
+        errorLevel: ErrorLevel = .medium
+    ) throws -> Bool {
+        do {
+            let required = try idealVersion(
+                for: content,
+                errorLevel: errorLevel
+            )
+            return required <= version
+        } catch {
+            throw QRError.encodingError(error.localizedDescription)
+        }
+    }
+    
+    /// Get version name (e.g., "1" or "M1")
+    public var versionName: String {
+        QREncoder.getVersionName(version)
+    }
+    
+    /// Calculate maximum content length for a version
+    public static func maximumContentLength(
+        version: Int,
+        errorLevel: ErrorLevel,
+        mode: Int? = nil
+    ) -> Int {
+        // Implementation would calculate maximum content length based on version,
+        // error level, and mode
+        QREncoder.calculateMaxContentLength(
+            version: version,
+            errorLevel: errorLevel.rawValue,
+            mode: mode
+        )
+    }
+}
+
+// MARK: - Debug Support
+extension QRCode: CustomDebugStringConvertible {
+    public var debugDescription: String {
+        """
+        QR Code:
+        Version: \(versionName)
+        Error Level: \(errorLevel.description)
+        Size: \(size)x\(size)
+        Mask: \(mask)
+        Module Count: \(size * size)
+        """
+    }
+}
