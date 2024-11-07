@@ -1110,3 +1110,265 @@ extension QREncoder {
         return nil
     }
 }
+
+// MARK: - Format Information
+extension QREncoder {
+    // Format information bit masks for regular QR codes
+    private static let FORMAT_INFO_MASK = 0x5412
+    
+    // Pre-calculated format information values
+    private static let FORMAT_INFO: [Int: Int] = [
+        // Format info for regular QR codes
+        // Index: mask pattern + (error level << 3)
+        0x00: 0x77C4,  // L,0
+        0x01: 0x72F3,  // L,1
+        0x02: 0x7DAA,  // L,2
+        0x03: 0x789D,  // L,3
+        0x04: 0x662F,  // L,4
+        0x05: 0x6318,  // L,5
+        0x06: 0x6C41,  // L,6
+        0x07: 0x6976,  // L,7
+        0x08: 0x5412,  // M,0
+        0x09: 0x5125,  // M,1
+        0x0A: 0x5E7C,  // M,2
+        0x0B: 0x5B4B,  // M,3
+        0x0C: 0x45F9,  // M,4
+        0x0D: 0x40CE,  // M,5
+        0x0E: 0x4F97,  // M,6
+        0x0F: 0x4AA0,  // M,7
+        0x10: 0x355F,  // Q,0
+        0x11: 0x3068,  // Q,1
+        0x12: 0x3F31,  // Q,2
+        0x13: 0x3A06,  // Q,3
+        0x14: 0x24B4,  // Q,4
+        0x15: 0x2183,  // Q,5
+        0x16: 0x2EDA,  // Q,6
+        0x17: 0x2BED,  // Q,7
+        0x18: 0x1689,  // H,0
+        0x19: 0x13BE,  // H,1
+        0x1A: 0x1CE7,  // H,2
+        0x1B: 0x19D0,  // H,3
+        0x1C: 0x0762,  // H,4
+        0x1D: 0x0255,  // H,5
+        0x1E: 0x0D0C,  // H,6
+        0x1F: 0x083B,  // H,7
+    ]
+    
+    // Pre-calculated format information for Micro QR codes
+    private static let FORMAT_INFO_MICRO: [Int: Int] = [
+        // Index: mask pattern + (error level << 2)
+        0x00: 0x4445,  // M1, mask 0
+        0x01: 0x4172,  // M1, mask 1
+        0x02: 0x4E2B,  // M1, mask 2
+        0x03: 0x4B1C,  // M1, mask 3
+        0x04: 0x55AE,  // M2-L, mask 0
+        0x05: 0x5099,  // M2-L, mask 1
+        0x06: 0x5FC0,  // M2-L, mask 2
+        0x07: 0x5AF7,  // M2-L, mask 3
+        0x08: 0x6793,  // M2-M, mask 0
+        0x09: 0x62A4,  // M2-M, mask 1
+        0x0A: 0x6DFD,  // M2-M, mask 2
+        0x0B: 0x68CA,  // M2-M, mask 3
+        0x0C: 0x7678,  // M3-L, mask 0
+        0x0D: 0x734F,  // M3-L, mask 1
+        0x0E: 0x7C16,  // M3-L, mask 2
+        0x0F: 0x7921,  // M3-L, mask 3
+        0x10: 0x06DE,  // M3-M, mask 0
+        0x11: 0x03E9,  // M3-M, mask 1
+        0x12: 0x0CB0,  // M3-M, mask 2
+        0x13: 0x0987,  // M3-M, mask 3
+        0x14: 0x1735,  // M4-L, mask 0
+        0x15: 0x1202,  // M4-L, mask 1
+        0x16: 0x1D5B,  // M4-L, mask 2
+        0x17: 0x186C,  // M4-L, mask 3
+        0x18: 0x2508,  // M4-M, mask 0
+        0x19: 0x203F,  // M4-M, mask 1
+        0x1A: 0x2F66,  // M4-M, mask 2
+        0x1B: 0x2A51,  // M4-M, mask 3
+        0x1C: 0x34E3,  // M4-Q, mask 0
+        0x1D: 0x31D4,  // M4-Q, mask 1
+        0x1E: 0x3E8D,  // M4-Q, mask 2
+        0x1F: 0x3BBA,  // M4-Q, mask 3
+    ]
+    
+    /// Maps error correction levels to their micro QR format info values
+    private static let ERROR_LEVEL_TO_MICRO_MAPPING: [Int: [Int: Int]] = [
+        QRConstants.VERSION_M1: [0: 0],
+        QRConstants.VERSION_M2: [QRConstants.ERROR_LEVEL_L: 1, QRConstants.ERROR_LEVEL_M: 2],
+        QRConstants.VERSION_M3: [QRConstants.ERROR_LEVEL_L: 3, QRConstants.ERROR_LEVEL_M: 4],
+        QRConstants.VERSION_M4: [QRConstants.ERROR_LEVEL_L: 5, QRConstants.ERROR_LEVEL_M: 6, QRConstants.ERROR_LEVEL_Q: 7],
+    ]
+    
+    /// Calculate format information bits
+    static func calculateFormatInfo(version: Int, errorLevel: Int, maskPattern: Int) throws -> Int {
+        let isMicro = version < 1
+        
+        if isMicro {
+            guard let versionMap = ERROR_LEVEL_TO_MICRO_MAPPING[version],
+                  let errorMapping = versionMap[errorLevel] else {
+                throw QREncoderError.invalidVersion("Invalid micro QR version/error level combination")
+            }
+            
+            let formatIndex = maskPattern + (errorMapping << 2)
+            guard let formatInfo = FORMAT_INFO_MICRO[formatIndex] else {
+                throw QREncoderError.invalidMask("Invalid mask pattern for Micro QR")
+            }
+            return formatInfo
+        } else {
+            var fmt = maskPattern
+            switch errorLevel {
+            case QRConstants.ERROR_LEVEL_L:
+                fmt += 0x08
+            case QRConstants.ERROR_LEVEL_H:
+                fmt += 0x10
+            case QRConstants.ERROR_LEVEL_Q:
+                fmt += 0x18
+            case QRConstants.ERROR_LEVEL_M:
+                break
+            default:
+                throw QREncoderError.invalidErrorLevel("Invalid error correction level")
+            }
+            
+            guard let formatInfo = FORMAT_INFO[fmt] else {
+                throw QREncoderError.invalidMask("Invalid mask pattern")
+            }
+            return formatInfo
+        }
+    }
+    
+    /// Add format information to the QR code matrix
+    static func addFormatInfo(to matrix: inout [[UInt8]],
+                            version: Int,
+                            errorLevel: Int,
+                            maskPattern: Int) throws {
+        let formatInfo = try calculateFormatInfo(version: version,
+                                               errorLevel: errorLevel,
+                                               maskPattern: maskPattern)
+        
+        let isMicro = version < 1
+        let vOffset = isMicro ? 1 : 0
+        let hOffset = vOffset
+        
+        // Place format info bits
+        for i in 0..<8 {
+            let vBit = UInt8((formatInfo >> i) & 1)
+            let hBit = UInt8((formatInfo >> (14 - i)) & 1)
+            
+            // Handle timing pattern for regular QR codes
+            let (vIndex, hIndex) = if i == 6 && !isMicro {
+                (i + 1, 1) // Skip timing pattern
+            } else {
+                (i, 0)
+            }
+            
+            // Vertical bit placement in upper left
+            matrix[vIndex + vOffset][8] = vBit
+            
+            // Horizontal bit placement in upper left
+            matrix[8][hIndex + hOffset] = hBit
+            
+            // For regular QR codes, add redundant format info
+            if !isMicro {
+                // Horizontal placement in upper right
+                matrix[8][matrix.count - 1 - i] = vBit
+                
+                // Vertical placement in bottom left
+                matrix[matrix.count - 1 - i][8] = hBit
+            }
+        }
+        
+        // For regular QR codes, add the dark module
+        if !isMicro {
+            matrix[matrix.count - 8][8] = 1
+        }
+    }
+    
+    /// Add version information to QR code matrix (only for versions 7 and up)
+    static func addVersionInfo(to matrix: inout [[UInt8]], version: Int) throws {
+        guard version >= 7 else { return }
+        
+        // Version information lookup table
+        let VERSION_INFO: [Int: Int] = [
+            7: 0x07C94,
+            8: 0x085BC,
+            9: 0x09A99,
+            10: 0x0A4D3,
+            11: 0x0BBF6,
+            12: 0x0C762,
+            13: 0x0D847,
+            14: 0x0E60D,
+            15: 0x0F928,
+            16: 0x10B78,
+            17: 0x1145D,
+            18: 0x12A17,
+            19: 0x13532,
+            20: 0x149A6,
+            21: 0x15683,
+            22: 0x168C9,
+            23: 0x177EC,
+            24: 0x18EC4,
+            25: 0x191E1,
+            26: 0x1AFAB,
+            27: 0x1B08E,
+            28: 0x1CC1A,
+            29: 0x1D33F,
+            30: 0x1ED75,
+            31: 0x1F250,
+            32: 0x209D5,
+            33: 0x216F0,
+            34: 0x228BA,
+            35: 0x2379F,
+            36: 0x24B0B,
+            37: 0x2542E,
+            38: 0x26A64,
+            39: 0x27541,
+            40: 0x28C69
+        ]
+        
+        guard let versionInfo = VERSION_INFO[version] else {
+            throw QREncoderError.invalidVersion("Invalid version number")
+        }
+        
+        // Place version information bits
+        for i in 0..<18 {
+            let bit = UInt8((versionInfo >> i) & 1)
+            let row = i / 3
+            let col = i % 3
+            
+            // Place in bottom-left corner
+            matrix[matrix.count - 11 + col][row] = bit
+            
+            // Place in upper-right corner
+            matrix[row][matrix.count - 11 + col] = bit
+        }
+    }
+}
+
+// MARK: - Format Information Utility Extensions
+extension QREncoder {
+    /// Get version name (e.g., "1" for version 1, "M1" for Micro QR version M1)
+    static func getVersionName(_ version: Int) -> String {
+        if version > 0 {
+            return String(version)
+        }
+        
+        switch version {
+        case QRConstants.VERSION_M1: return "M1"
+        case QRConstants.VERSION_M2: return "M2"
+        case QRConstants.VERSION_M3: return "M3"
+        case QRConstants.VERSION_M4: return "M4"
+        default: return "Unknown"
+        }
+    }
+    
+    /// Get error level name (L, M, Q, or H)
+    static func getErrorLevelName(_ errorLevel: Int) -> String {
+        switch errorLevel {
+        case QRConstants.ERROR_LEVEL_L: return "L"
+        case QRConstants.ERROR_LEVEL_M: return "M"
+        case QRConstants.ERROR_LEVEL_Q: return "Q"
+        case QRConstants.ERROR_LEVEL_H: return "H"
+        default: return "Unknown"
+        }
+    }
+}
