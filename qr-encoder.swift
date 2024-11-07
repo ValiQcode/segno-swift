@@ -227,3 +227,194 @@ class Buffer {
         return data.count
     }
 }
+
+// MARK: - Matrix Generation
+extension QREncoder {
+    // MARK: - Matrix Creation
+    static func makeMatrix(width: Int, height: Int, reserveRegions: Bool = true, addTiming: Bool = true) -> [[UInt8]] {
+        let isSquare = width == height
+        let isMicro = isSquare && width < 21
+        
+        // Initialize matrix with 0x2 (illegal value)
+        var matrix = Array(repeating: Array(repeating: UInt8(2), count: width), count: height)
+        
+        if reserveRegions {
+            // Reserve version pattern areas for QR Codes version 7 and larger
+            if isSquare && width > 41 {
+                for i in 0..<6 {
+                    // Upper right
+                    matrix[i][width - 11] = 0
+                    matrix[i][width - 10] = 0
+                    matrix[i][width - 9] = 0
+                    
+                    // Lower left
+                    matrix[height - 11][i] = 0
+                    matrix[height - 10][i] = 0
+                    matrix[height - 9][i] = 0
+                }
+            }
+            
+            // Reserve format pattern areas
+            for i in 0..<9 {
+                // Upper left
+                matrix[i][8] = 0
+                // Upper bottom
+                matrix[8][i] = 0
+                
+                if !isMicro {
+                    // Bottom left
+                    matrix[height - i - 1][8] = 0
+                    // Upper right
+                    matrix[8][width - i - 1] = 0
+                }
+            }
+        }
+        
+        if addTiming {
+            addTimingPattern(to: &matrix, isMicro: isMicro)
+        }
+        
+        return matrix
+    }
+    
+    // MARK: - Finder Patterns
+    static func addFinderPatterns(to matrix: inout [[UInt8]], width: Int, height: Int) {
+        let finderPattern: [[UInt8]] = [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 1, 1, 1, 1, 0],
+            [0, 1, 0, 0, 0, 0, 0, 1, 0],
+            [0, 1, 0, 1, 1, 1, 0, 1, 0],
+            [0, 1, 0, 1, 1, 1, 0, 1, 0],
+            [0, 1, 0, 1, 1, 1, 0, 1, 0],
+            [0, 1, 0, 0, 0, 0, 0, 1, 0],
+            [0, 1, 1, 1, 1, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0]
+        ]
+        
+        let isSquare = width == height
+        let corners: [(x: Int, y: Int)] = isSquare && width < 21
+            ? [(0, 0)]  // Micro QR has only one finder pattern
+            : [(0, 0), (0, height - 8), (width - 8, 0)]  // Regular QR has three finder patterns
+        
+        for (x, y) in corners {
+            let xOffset = x == 0 ? 1 : 0
+            let yOffset = y == 0 ? 1 : 0
+            
+            for i in 0..<8 {
+                for j in 0..<8 {
+                    matrix[y + i][x + j] = finderPattern[i + xOffset][j + yOffset]
+                }
+            }
+        }
+    }
+    
+    // MARK: - Timing Pattern
+    static func addTimingPattern(to matrix: inout [[UInt8]], isMicro: Bool) {
+        let (start, end) = isMicro ? (0, matrix.count) : (6, matrix.count - 8)
+        var bit: UInt8 = 1
+        
+        for i in 8..<end {
+            matrix[i][start] = bit
+            matrix[start][i] = bit
+            bit ^= 1
+        }
+    }
+    
+    // MARK: - Alignment Patterns
+    static func addAlignmentPatterns(to matrix: inout [[UInt8]], width: Int, height: Int) {
+        let isSquare = width == height
+        let version = (width - 17) / 4  // Calculate version from matrix size
+        
+        // QR Codes version < 2 don't have alignment patterns
+        guard isSquare && version >= 2 else { return }
+        
+        let pattern: [UInt8] = [
+            1, 1, 1, 1, 1,
+            1, 0, 0, 0, 1,
+            1, 0, 1, 0, 1,
+            1, 0, 0, 0, 1,
+            1, 1, 1, 1, 1
+        ]
+        
+        // Get alignment pattern positions based on version
+        let positions = getAlignmentPatternPositions(version: version)
+        let minPos = positions.first ?? 0
+        let maxPos = positions.last ?? 0
+        
+        // Skip positions that would overlap with finder patterns
+        let finderPositions = Set([
+            (minPos, minPos),
+            (minPos, maxPos),
+            (maxPos, minPos)
+        ])
+        
+        for x in positions {
+            for y in positions {
+                guard !finderPositions.contains((x, y)) else { continue }
+                
+                // Add alignment pattern centered at (x, y)
+                let xStart = x - 2
+                let yStart = y - 2
+                
+                for i in 0..<5 {
+                    for j in 0..<5 {
+                        matrix[yStart + i][xStart + j] = pattern[i * 5 + j]
+                    }
+                }
+            }
+        }
+    }
+    
+    // MARK: - Helper Methods
+    private static func getAlignmentPatternPositions(version: Int) -> [Int] {
+        // This is a simplified version. In a complete implementation,
+        // this would return the actual alignment pattern positions for each version
+        guard version >= 2 && version <= 40 else { return [] }
+        
+        if version == 2 {
+            return [6, 18]
+        }
+        
+        // For versions > 2, calculate positions based on the QR code specification
+        var positions: [Int] = []
+        let step = version <= 6 ? 28 : (version <= 22 ? 26 : 28)
+        let numAlign = (version / 7) + 2
+        
+        let start = 6
+        let end = version * 4 + 10
+        
+        if numAlign == 2 {
+            positions = [start, end]
+        } else {
+            let delta = (end - start) / (numAlign - 1)
+            positions = (0..<numAlign).map { start + $0 * delta }
+        }
+        
+        return positions
+    }
+    
+    // MARK: - Matrix Size Calculation
+    static func calculateMatrixSize(version: Int) -> Int {
+        return version > 0 ? version * 4 + 17 : (version + 4) * 2 + 9
+    }
+    
+    // MARK: - Matrix Validation
+    static func isEncodingRegion(matrix: [[UInt8]], row: Int, col: Int) -> Bool {
+        return matrix[row][col] > 0x1
+    }
+}
+
+// MARK: - Matrix Utilities
+extension Array where Element == [UInt8] {
+    func copy() -> [[UInt8]] {
+        return self.map { $0 }
+    }
+    
+    mutating func setRegion(_ pattern: [[UInt8]], atRow row: Int, column: Int) {
+        for (i, patternRow) in pattern.enumerated() {
+            for (j, value) in patternRow.enumerated() {
+                self[row + i][column + j] = value
+            }
+        }
+    }
+}
