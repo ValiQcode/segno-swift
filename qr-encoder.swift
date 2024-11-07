@@ -1660,3 +1660,325 @@ extension QREncoder {
         return parity
     }
 }
+
+// MARK: - Input Validation
+extension QREncoder {
+    /// Configuration options for QR code generation
+    struct EncodingOptions {
+        let version: Int?
+        let errorLevel: Int?
+        let mode: Int?
+        let mask: Int?
+        let encoding: String?
+        let eci: Bool
+        let micro: Bool?
+        let boostError: Bool
+        
+        init(version: Int? = nil,
+             errorLevel: Int? = nil,
+             mode: Int? = nil,
+             mask: Int? = nil,
+             encoding: String? = nil,
+             eci: Bool = false,
+             micro: Bool? = nil,
+             boostError: Bool = true) {
+            self.version = version
+            self.errorLevel = errorLevel
+            self.mode = mode
+            self.mask = mask
+            self.encoding = encoding
+            self.eci = eci
+            self.micro = micro
+            self.boostError = boostError
+        }
+    }
+    
+    /// Main validation and encoding entry point
+    static func validateAndEncode(_ content: String, options: EncodingOptions) throws -> Code {
+        // Step 1: Validate and normalize input parameters
+        let validatedParams = try validateParameters(content: content, options: options)
+        
+        // Step 2: Validate content against chosen mode
+        try validateContent(content, for: validatedParams.mode)
+        
+        // Step 3: Check version compatibility
+        try validateVersionCompatibility(
+            content: content,
+            version: validatedParams.version,
+            mode: validatedParams.mode,
+            errorLevel: validatedParams.errorLevel,
+            micro: validatedParams.micro
+        )
+        
+        // Step 4: Perform the encoding
+        return try encode(
+            content: content,
+            error: validatedParams.errorLevel,
+            version: validatedParams.version,
+            mode: validatedParams.mode,
+            mask: validatedParams.mask,
+            encoding: validatedParams.encoding,
+            eci: validatedParams.eci,
+            micro: validatedParams.micro,
+            boostError: validatedParams.boostError
+        )
+    }
+    
+    // MARK: - Parameter Validation
+    
+    private struct ValidatedParameters {
+        let version: Int?
+        let errorLevel: Int?
+        let mode: Int?
+        let mask: Int?
+        let encoding: String?
+        let eci: Bool
+        let micro: Bool?
+        let boostError: Bool
+    }
+    
+    private static func validateParameters(content: String, options: EncodingOptions) throws -> ValidatedParameters {
+        // Validate content
+        guard !content.isEmpty else {
+            throw QREncoderError.invalidInput("Content cannot be empty")
+        }
+        
+        // Validate version
+        let version = try validateVersion(options.version, micro: options.micro)
+        
+        // Validate error level
+        let errorLevel = try validateErrorLevel(
+            options.errorLevel,
+            version: version,
+            micro: options.micro
+        )
+        
+        // Validate mode
+        let mode = try validateMode(
+            options.mode,
+            version: version,
+            content: content
+        )
+        
+        // Validate mask pattern
+        let mask = try validateMask(
+            options.mask,
+            version: version
+        )
+        
+        // Validate encoding
+        let encoding = try validateEncoding(
+            options.encoding,
+            mode: mode,
+            eci: options.eci
+        )
+        
+        return ValidatedParameters(
+            version: version,
+            errorLevel: errorLevel,
+            mode: mode,
+            mask: mask,
+            encoding: encoding,
+            eci: options.eci,
+            micro: options.micro,
+            boostError: options.boostError
+        )
+    }
+    
+    // MARK: - Specific Validation Methods
+    
+    private static func validateVersion(_ version: Int?, micro: Bool?) throws -> Int? {
+        guard let version = version else { return nil }
+        
+        if micro == true {
+            guard QRConstants.MICRO_VERSIONS.contains(version) else {
+                throw QREncoderError.invalidVersion("Invalid Micro QR version: \(version)")
+            }
+        } else if micro == false {
+            guard (1...40).contains(version) else {
+                throw QREncoderError.invalidVersion("QR version must be between 1 and 40")
+            }
+        }
+        
+        return version
+    }
+    
+    private static func validateErrorLevel(_ errorLevel: Int?, version: Int?, micro: Bool?) throws -> Int? {
+        guard let errorLevel = errorLevel else { return nil }
+        
+        // Validate error level range
+        guard (0...3).contains(errorLevel) else {
+            throw QREncoderError.invalidErrorLevel("Error level must be between 0 and 3")
+        }
+        
+        // Validate error level for Micro QR
+        if let version = version, version < 1 {
+            // M1 only supports error level 0
+            if version == QRConstants.VERSION_M1 && errorLevel != 0 {
+                throw QREncoderError.invalidErrorLevel("M1 only supports error level 0")
+            }
+            
+            // M2 only supports L and M
+            if version == QRConstants.VERSION_M2 && errorLevel > QRConstants.ERROR_LEVEL_M {
+                throw QREncoderError.invalidErrorLevel("M2 only supports error levels L and M")
+            }
+            
+            // No Micro QR supports H
+            if errorLevel == QRConstants.ERROR_LEVEL_H {
+                throw QREncoderError.invalidErrorLevel("Micro QR does not support error level H")
+            }
+        }
+        
+        return errorLevel
+    }
+    
+    private static func validateMode(_ mode: Int?, version: Int?, content: String) throws -> Int? {
+        guard let mode = mode else { return nil }
+        
+        // Validate mode range
+        let validModes = [
+            QRConstants.MODE_NUMERIC,
+            QRConstants.MODE_ALPHANUMERIC,
+            QRConstants.MODE_BYTE,
+            QRConstants.MODE_KANJI,
+            QRConstants.MODE_HANZI
+        ]
+        
+        guard validModes.contains(mode) else {
+            throw QREncoderError.invalidMode("Invalid mode specified")
+        }
+        
+        // Validate mode compatibility with version
+        if let version = version {
+            try validateModeVersionCompatibility(mode: mode, version: version)
+        }
+        
+        // Validate content compatibility with mode
+        try validateContentModeCompatibility(content: content, mode: mode)
+        
+        return mode
+    }
+    
+    private static func validateMask(_ mask: Int?, version: Int?) throws -> Int? {
+        guard let mask = mask else { return nil }
+        
+        if let version = version {
+            let isMicro = version < 1
+            if isMicro {
+                guard (0...3).contains(mask) else {
+                    throw QREncoderError.invalidMask("Micro QR mask must be between 0 and 3")
+                }
+            } else {
+                guard (0...7).contains(mask) else {
+                    throw QREncoderError.invalidMask("QR mask must be between 0 and 7")
+                }
+            }
+        }
+        
+        return mask
+    }
+    
+    private static func validateEncoding(_ encoding: String?, mode: Int?, eci: Bool) throws -> String? {
+        guard let encoding = encoding else { return nil }
+        
+        // Validate encoding string
+        if !String.availableStringEncodings.contains(where: {
+            CFStringConvertEncodingToIANACharSetName($0.rawValue) as String? == encoding
+        }) {
+            throw QREncoderError.invalidEncoding("Unsupported encoding: \(encoding)")
+        }
+        
+        // Validate ECI usage
+        if eci && mode == QRConstants.MODE_BYTE && encoding != QRConstants.DEFAULT_BYTE_ENCODING {
+            // Verify ECI assignment number exists
+            try _ = getECIAssignmentNumber(for: encoding)
+        }
+        
+        return encoding
+    }
+    
+    // MARK: - Content Validation
+    
+    private static func validateContent(_ content: String, for mode: Int?) throws {
+        guard let mode = mode else { return }
+        
+        switch mode {
+        case QRConstants.MODE_NUMERIC:
+            guard content.allSatisfy({ $0.isNumber }) else {
+                throw QREncoderError.invalidContent("Content contains non-numeric characters")
+            }
+            
+        case QRConstants.MODE_ALPHANUMERIC:
+            let validChars = Set(QRConstants.ALPHANUMERIC_CHARS)
+            guard content.allSatisfy({ validChars.contains($0) }) else {
+                throw QREncoderError.invalidContent("Content contains invalid alphanumeric characters")
+            }
+            
+        case QRConstants.MODE_KANJI:
+            guard let data = content.data(using: .shiftJIS),
+                  isKanji(data) else {
+                throw QREncoderError.invalidContent("Content is not valid Kanji")
+            }
+            
+        case QRConstants.MODE_HANZI:
+            guard let data = content.data(using: .gb_18030_2000) else {
+                throw QREncoderError.invalidContent("Content is not valid Hanzi")
+            }
+            // Additional Hanzi validation could be added here
+            
+        default:
+            break // BYTE mode accepts any content
+        }
+    }
+    
+    // MARK: - Version Compatibility
+    
+    private static func validateVersionCompatibility(content: String,
+                                                   version: Int?,
+                                                   mode: Int?,
+                                                   errorLevel: Int?,
+                                                   micro: Bool?) throws {
+        // Early return if no specific version is requested
+        guard let version = version else { return }
+        
+        // Check if mode is supported by version
+        if let mode = mode {
+            try validateModeVersionCompatibility(mode: mode, version: version)
+        }
+        
+        // Calculate required version for content
+        let segments = try prepareData(content: content, mode: mode, encoding: nil)
+        let requiredVersion = try findVersion(segments: segments,
+                                            error: errorLevel,
+                                            eci: false,
+                                            micro: micro)
+        
+        // Verify content fits in specified version
+        if requiredVersion > version {
+            throw QREncoderError.dataOverflow(
+                "Content too large for version \(getVersionName(version)). " +
+                "Requires version \(getVersionName(requiredVersion))"
+            )
+        }
+    }
+    
+    private static func validateModeVersionCompatibility(mode: Int, version: Int) throws {
+        let isMicro = version < 1
+        
+        // M1 only supports numeric mode
+        if version == QRConstants.VERSION_M1 && mode != QRConstants.MODE_NUMERIC {
+            throw QREncoderError.invalidMode("M1 only supports numeric mode")
+        }
+        
+        // M2 supports numeric and alphanumeric
+        if version == QRConstants.VERSION_M2 &&
+            ![QRConstants.MODE_NUMERIC, QRConstants.MODE_ALPHANUMERIC].contains(mode) {
+            throw QREncoderError.invalidMode("M2 only supports numeric and alphanumeric modes")
+        }
+        
+        // Verify mode is supported for Micro QR
+        if isMicro && mode == QRConstants.MODE_KANJI {
+            throw QREncoderError.invalidMode("Kanji mode is not supported in Micro QR")
+        }
+    }
+}
